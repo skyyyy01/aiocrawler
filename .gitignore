@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# 虚拟环境
+.venv/
+venv/
+
+# 测试与缓存
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+
+# 抓取产物与断点续爬状态
+out/
+*.jsonl
+*.csv
+*.db
+*.sqlite
+*.sqlite3
+
+# 环境变量
+.env
+.env.*
+
+# macOS
+.DS_Store

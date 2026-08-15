@@ -1,0 +1,39 @@
+# aiocrawler 配置文件
+#
+# 优先级由低到高：
+#   内置默认 < [default] < spider 的 custom_settings < [spider.<名字>] < 命令行参数
+#
+# [spider.<名字>] 排在 custom_settings 之后是刻意的：代码里的 custom_settings 是
+# 爬虫作者给的默认值，而这里的专属段属于运维侧调整，调线上行为不必改代码。
+
+[default]
+# 并发
+concurrency = 16
+
+# 礼貌抓取：默认值偏保守，抓生产站点时建议保持
+download_delay = 1.0
+download_delay_jitter = 0.3
+respect_robots = true
+
+# 重试
+max_retries = 3
+retry_backoff_base = 1.0
+
+# 存储攒批
+batch_size = 200
+flush_interval = 5.0
+
+log_level = "INFO"
+
+
+# ---- 各爬虫的专属调整 ----
+# 下面两段与 spiders/*.py 里的 custom_settings 保持一致，改这里即可覆盖代码。
+
+[spider.books]
+concurrency = 8
+download_delay = 0.1
+
+[spider.quotes_js]
+concurrency = 4
+download_delay = 0.2
+browser_contexts = 4

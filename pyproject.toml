@@ -1,0 +1,40 @@
+[project]
+name = "aiocrawler"
+version = "0.1.0"
+description = "自研 Python 异步爬虫框架：可插拔的调度器、下载器、中间件与存储后端"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx[http2]>=0.28",
+    "selectolax>=0.4",
+    "pydantic>=2.11",
+    "structlog>=25.0",
+    "typer>=0.15",
+]
+
+[project.optional-dependencies]
+# 阶段 3：浏览器渲染
+browser = ["playwright>=1.50"]
+# 阶段 4：各存储后端按需安装
+sqlite = ["aiosqlite>=0.21"]
+postgres = ["asyncpg>=0.30"]
+mysql = ["aiomysql>=0.2"]
+mongo = ["pymongo>=4.13"]          # 注意：不用 motor，PyMongo 4.13+ 已内置 async
+dev = ["pytest>=8", "pytest-asyncio>=1.0", "respx>=0.22"]
+
+[project.scripts]
+aiocrawler = "aiocrawler.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["aiocrawler"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "browser: 需要真实 Chromium 的用例，用 -m 'not browser' 可跳过",
+    "live: 需要真实数据库服务，未配置 DSN 环境变量时自动跳过",
+]
