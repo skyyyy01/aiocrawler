@@ -1,5 +1,7 @@
 # aiocrawler
 
+**[中文](README.md)** | [English](docs/README_EN.md)
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 自研 Python 异步爬虫框架。基于 `asyncio` + `httpx` 从零实现调度器、下载器、
