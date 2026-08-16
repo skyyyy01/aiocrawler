@@ -1,55 +1,57 @@
 # aiocrawler
 
-**[中文](README.md)** | [English](docs/README_EN.md)
+**[English](README.md)** | [中文](docs/README_ZH.md)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-自研 Python 异步爬虫框架。基于 `asyncio` + `httpx` 从零实现调度器、下载器、
-中间件链、管道与存储后端——不依赖 Scrapy。
+An async web crawling framework for Python, built from scratch. Scheduler,
+downloader, middleware chain, pipeline and storage backends are all implemented
+on top of `asyncio` + `httpx` — no Scrapy dependency.
 
-**六个阶段全部完成并经过真实环境验证。**
+**All six stages are complete and verified against real-world targets.**
 
-| 能力 | 实现 |
+| Capability | Implementation |
 |---|---|
-| 调度 | 内存 / SQLite 持久化 / Redis 分布式，三者满足同一接口 |
-| 下载 | HTTP（httpx）与浏览器渲染（Playwright）混合，按请求路由 |
-| 中间件 | 重试、按域名限速、robots.txt、UA 轮换、代理池 |
-| 存储 | JSONL / CSV / SQLite / PostgreSQL / MySQL / MongoDB |
-| 工程化 | 配置四层合并、断点续爬、优雅退出、CLI |
+| Scheduling | In-memory / SQLite-persistent / Redis-distributed, all behind one interface |
+| Downloading | HTTP (httpx) and browser rendering (Playwright), routed per request |
+| Middleware | Retry, per-domain throttling, robots.txt, UA rotation, proxy pool |
+| Storage | JSONL / CSV / SQLite / PostgreSQL / MySQL / MongoDB |
+| Engineering | Four-layer config merge, resumable crawls, graceful shutdown, CLI |
 
 ---
 
-## 快速开始
+## Quick start
 
 ```bash
-# 安装（按需选装可选组）
+# Install (optional groups as needed)
 .venv/bin/pip install -e ".[dev,browser,sqlite,postgres,mysql,mongo]"
-.venv/bin/playwright install chromium        # 仅浏览器渲染需要
+.venv/bin/playwright install chromium        # only for browser rendering
 
-.venv/bin/python -m aiocrawler list          # 列出爬虫
-.venv/bin/python -m aiocrawler run books     # 静态站，约 35 秒 / 1000 条
-.venv/bin/python -m aiocrawler run quotes_js # JS 渲染站，100 条
+.venv/bin/python -m aiocrawler list          # list spiders
+.venv/bin/python -m aiocrawler run books     # static site, ~35s for 1000 items
+.venv/bin/python -m aiocrawler run quotes_js # JS-rendered site, 100 items
 ```
 
-常用参数：
+Common options:
 
 ```bash
--n 20                     # 只抓 20 条（调试用）
--o out/x.csv              # 换输出格式
--o "postgresql://u:p@h/db"  # 直接写数据库
--c 4 --delay 0.5          # 并发与限速
---resume                  # 断点续爬，中断后接着跑
---redis redis://host:6379/0  # 分布式：多节点共享队列
+-n 20                     # scrape only 20 items (for debugging)
+-o out/x.csv              # change output format
+-o "postgresql://u:p@h/db"  # write straight to a database
+-c 4 --delay 0.5          # concurrency and throttling
+--resume                  # resumable crawl, pick up where it stopped
+--redis redis://host:6379/0  # distributed: shared queue across nodes
 ```
 
-测试：
+Tests:
 
 ```bash
-.venv/bin/python -m pytest -q          # 188 通过，需外部服务的自动跳过
-.venv/bin/python -m pytest -m "not browser"   # 跳过需要 Chromium 的用例
+.venv/bin/python -m pytest -q          # 188 pass; those needing services skip themselves
+.venv/bin/python -m pytest -m "not browser"   # skip cases requiring Chromium
 ```
 
-外部服务通过环境变量接入，未设置则相关用例自动跳过：
+External services are wired in through environment variables. Leave them unset
+and the corresponding cases skip automatically:
 
 ```bash
 AIOCRAWLER_TEST_PG=postgresql://postgres:pass@127.0.0.1:5432/crawl
@@ -60,9 +62,9 @@ AIOCRAWLER_TEST_REDIS=redis://127.0.0.1:6379/0
 
 ---
 
-## 写一个爬虫
+## Writing a spider
 
-放进 `spiders/` 即被自动发现：
+Drop it into `spiders/` and it is discovered automatically:
 
 ```python
 from aiocrawler import BaseSpider, Item, Response
@@ -74,12 +76,13 @@ class MyItem(Item):
 class MySpider(BaseSpider):
     name = "my"
     start_urls = ["https://example.com/list"]
-    renderer = "http"                      # 整站需要 JS 渲染就改成 "browser"
+    renderer = "http"                      # switch to "browser" if the whole site needs JS
     custom_settings = {"concurrency": 8, "download_delay": 0.5}
 
     async def parse(self, response: Response):
         for a in response.css("a.item"):
-            # priority 越大越优先出队；详情页给正数可避免队列堆积
+            # higher priority dequeues first; a positive value on detail pages
+            # keeps the queue from piling up
             yield response.follow(a.attributes["href"], callback="parse_detail", priority=1)
 
     async def parse_detail(self, response: Response):
@@ -87,187 +90,203 @@ class MySpider(BaseSpider):
                      price=float(response.text_of("span.price").lstrip("¥")))
 ```
 
-`parse` 是 async generator：`yield` 出 `Item` 进管道存盘，`yield` 出 `Request` 继续抓。
-单个请求要用浏览器渲染时写 `Request(url, renderer="browser")`，`follow()` 默认继承当前页的渲染方式。
+`parse` is an async generator: `yield` an `Item` to send it down the pipeline for
+storage, `yield` a `Request` to keep crawling. To render one single request in a
+browser, write `Request(url, renderer="browser")`; `follow()` inherits the current
+page's renderer by default.
 
 ---
 
-## 数据流
+## Data flow
 
 ```
 Spider.start_requests()  ─→  Request
                                 │
-                    ┌───────────▼────────────┐
-                    │ Scheduler              │  优先级队列 + 指纹去重
-                    │  内存 / SQLite / Redis │  三者同一接口
-                    └───────────┬────────────┘
-                                │  Engine 的 worker 池按并发上限拉取
-                    ┌───────────▼────────────┐
-                    │ 中间件请求侧（正序）   │  重试→robots→UA→代理→限速
-                    └───────────┬────────────┘
-                    ┌───────────▼────────────┐
-                    │ DownloaderRouter       │  按 request.renderer 分发
-                    │   ├ HttpDownloader     │  httpx（默认）
-                    │   └ BrowserDownloader  │  Playwright（惰性启动）
-                    └───────────┬────────────┘
+                   ┌────────────▼─────────────┐
+                   │ Scheduler                │  priority queue + fingerprint dedup
+                   │  Memory / SQLite / Redis │  three impls, one interface
+                   └────────────┬─────────────┘
+                                │  Engine's worker pool pulls up to the concurrency cap
+                   ┌────────────▼─────────────┐
+                   │ Middleware: request side │  retry→robots→UA→proxy→throttle
+                   └────────────┬─────────────┘
+                   ┌────────────▼─────────────┐
+                   │ DownloaderRouter         │  dispatches on request.renderer
+                   │   ├ HttpDownloader       │  httpx (default)
+                   │   └ BrowserDownloader    │  Playwright (started lazily)
+                   └────────────┬─────────────┘
                                 ▼  Response
-                    ┌────────────────────────┐
-                    │ 中间件响应侧（逆序）   │  重试判定 / 异常兜底
-                    └───────────┬────────────┘
-                    ┌───────────▼────────────┐
-                    │ Spider.parse(response) │  你唯一要写的代码
-                    └──────┬──────────┬──────┘
-                     Item  │          │  Request ──→ 回到 Scheduler
-                    ┌──────▼──────────────────┐
-                    │ Pipeline（攒批缓冲）    │
-                    └───────────┬─────────────┘
-                    ┌───────────▼─────────────┐
-                    │ Storage backend         │  文件 / SQL / 文档库
-                    └─────────────────────────┘
+                   ┌──────────────────────────┐
+                   │ Middleware: response side│  retry decision / exception fallback
+                   └────────────┬─────────────┘
+                   ┌────────────▼─────────────┐
+                   │ Spider.parse(response)   │  the only code you have to write
+                   └───────┬───────────┬──────┘
+                      Item │           │  Request ──→ back to the Scheduler
+                   ┌───────▼──────────────────┐
+                   │ Pipeline (batch buffer)  │
+                   └────────────┬─────────────┘
+                   ┌────────────▼─────────────┐
+                   │ Storage backend          │  files / SQL / document stores
+                   └──────────────────────────┘
 ```
 
 ---
 
-## 代码导览
+## Code tour
 
-按此顺序读最易理解：
+Reading in this order is the easiest way in:
 
-| 文件 | 职责 | 关键点 |
+| File | Responsibility | Key point |
 |---|---|---|
-| `models.py` | Request / Response / Item | **`callback` 存方法名字符串**，使 Request 可 JSON 序列化 |
-| `scheduler/base.py` | 调度器接口 | 全框架最重要的抽象边界；`ack` 支撑可靠队列 |
-| `scheduler/memory.py` | 内存实现 | heapq 取负值实现大顶堆；自增序号避免比较到 Request |
-| `scheduler/sqlite.py` | 持久化实现 | pending/inflight 两态，未 ack 的请求重启后复活 |
-| `scheduler/redis_backend.py` | 分布式实现 | Lua 保证 pop 原子；可见性超时区分「活跃」与「已死」 |
-| `middleware/base.py` | 中间件链 | 请求正序、响应逆序的洋葱结构 |
-| `middleware/retry.py` | 重试 | 指数退避 + 抖动；**重试请求必须 `dont_filter`** |
-| `middleware/throttle.py` | 限速 | **按域名独立**，不是全局共享速率 |
-| `downloader/router.py` | 混合分发 | 浏览器惰性启动，纯 HTTP 爬虫零开销 |
-| `downloader/browser.py` | 渲染 | 单 Browser + context 池；默认拦截图片字体 |
-| `engine.py` | 主循环 | 结束判定；`_inflight` 递减必须在新请求入队之后 |
-| `pipeline/storage.py` | 攒批 | 满 200 条或超 5 秒落盘；关闭前必须 flush |
-| `storage/` | 六种后端 | 统一 `open/write(batch)/close` |
+| `models.py` | Request / Response / Item | **`callback` holds a method name string**, which keeps Request JSON-serializable |
+| `scheduler/base.py` | Scheduler interface | The most important abstraction boundary in the framework; `ack` is what makes the queue reliable |
+| `scheduler/memory.py` | In-memory impl | heapq with negated values for a max-heap; a monotonic counter prevents ever comparing Requests |
+| `scheduler/sqlite.py` | Persistent impl | pending/inflight two-state model; un-acked requests come back after a restart |
+| `scheduler/redis_backend.py` | Distributed impl | Lua makes pop atomic; a visibility timeout separates "alive" from "dead" |
+| `middleware/base.py` | Middleware chain | Onion structure: requests in order, responses in reverse |
+| `middleware/retry.py` | Retry | Exponential backoff with jitter; **retried requests must set `dont_filter`** |
+| `middleware/throttle.py` | Throttling | **Per-domain**, not one globally shared rate |
+| `downloader/router.py` | Hybrid dispatch | Browser starts lazily, so pure-HTTP crawls pay nothing |
+| `downloader/browser.py` | Rendering | One Browser plus a context pool; images and fonts blocked by default |
+| `engine.py` | Main loop | Termination detection; `_inflight` must be decremented *after* new requests are enqueued |
+| `pipeline/storage.py` | Batching | Flushes at 200 items or 5 seconds; must flush before closing |
+| `storage/` | Six backends | Uniform `open/write(batch)/close` |
 
 ---
 
-## 七个关键设计决策
+## Seven key design decisions
 
-1. **`callback` 存字符串而非函数引用**（`models.py`）
-   使 `Request` 成为纯数据、可 JSON 序列化，这是分布式升级的前提。
-   Scrapy 用 pickle 序列化闭包，是其分布式方案长期的痛点来源。
+1. **`callback` stores a string, not a function reference** (`models.py`)
+   This makes `Request` pure data and JSON-serializable, which is the prerequisite
+   for going distributed. Scrapy pickles closures instead, a long-standing source
+   of pain in its distributed setups.
 
-2. **结束判定要看在途计数**（`engine.py`）
-   队列空 ≠ 爬完了，可能有 worker 正在解析、马上产出新链接。且 `_inflight`
-   递减必须发生在新请求入队之后，顺序颠倒会静默丢数据。
+2. **Termination has to look at the in-flight count** (`engine.py`)
+   An empty queue does not mean the crawl is done — a worker may be parsing right
+   now and about to emit new links. And `_inflight` must be decremented *after*
+   new requests are enqueued; getting that order wrong drops data silently.
 
-3. **限速按域名独立**（`middleware/throttle.py`）
-   全局共享速率会让一个慢站点拖垮所有站点的配额。
+3. **Throttling is per-domain** (`middleware/throttle.py`)
+   A globally shared rate lets one slow site eat everyone else's quota.
 
-4. **重试请求必须带 `dont_filter`**（`middleware/retry.py`）
-   否则指纹与原请求相同，会被去重器静默丢弃——表现为「重试完全不生效」
-   且没有任何报错。
+4. **Retried requests must carry `dont_filter`** (`middleware/retry.py`)
+   Otherwise their fingerprint matches the original and the dedup filter drops
+   them silently — which shows up as "retries do nothing at all", with no error
+   anywhere.
 
-5. **中间件顺序：Retry 最前、Throttle 最后**（`middleware/__init__.py`）
-   响应/异常侧逆序执行，Retry 放最前意味着它最后执行，这样 Proxy 才有机会
-   先把失效代理标记进冷却，重试时才能选到健康代理。
+5. **Middleware order: Retry first, Throttle last** (`middleware/__init__.py`)
+   The response/exception side runs in reverse, so putting Retry first means it
+   runs last. That is what gives Proxy a chance to mark a dead proxy into cooldown
+   first, so the retry can pick a healthy one.
 
-6. **浏览器复用 + 惰性启动**（`downloader/`）
-   全程一个 Browser 进程、固定数量 context 池；没有 browser 请求时
-   Chromium 根本不启动。
+6. **Browser reuse plus lazy startup** (`downloader/`)
+   One Browser process for the whole run with a fixed-size context pool; if no
+   request needs a browser, Chromium never starts at all.
 
-7. **可见性超时区分「活跃」与「已死」**（`scheduler/redis_backend.py`）
-   单机重启时回收全部残留 inflight 是安全的，分布式下这样做会抢走其他
-   节点正在处理的请求。详见下方验证记录。
-
----
-
-## 验证记录
-
-各阶段均在真实环境下验证，而非仅靠打桩测试。
-
-**静态站全量抓取**（`books.toscrape.com`）
-```
-请求 1050 个 | 响应 1050 个 | 失败 0 个 | 产出 1000 条 | 耗时 34.5s
-```
-请求数 1050 = 50 个列表页 + 1000 个详情页，与站点结构完全吻合；
-1000 条记录的 URL 与 UPC 均唯一，覆盖 50 个分类。
-
-**混合下载器对照**（`quotes.toscrape.com/js`，内容纯由 JS 生成）
-```
-同一 URL、同样 200 响应，只改 renderer：
-  renderer='http'     →   0 条
-  renderer='browser'  →  10 条
-```
-
-**四种数据库后端一致性**：同一批数据分别写入 SQLite / PostgreSQL / MySQL /
-MongoDB，读回比对完全一致；重跑一次条数不变，UPSERT 幂等。
-PG/MySQL/Mongo 用临时 Docker 容器实测，非 mock。
-
-**优雅退出**：把攒批阈值设为 100000（远大于抓取量），抓 6 秒后发 SIGINT，
-文件仍有 48 条——证明缓冲确实被刷盘，中断不丢数据。
-
-**断点续爬**：中断后 `--resume` 继续，两轮合计 74 行、0 重复，
-去重表跨进程复用。
-
-**分布式**：两个独立进程共享 Redis 队列抓完全站
-```
-节点 A 509 条 + 节点 B 491 条 = 1000 条，重叠 0 条
-总请求 1050 = 总响应 1050（无任何重复下载）
-```
-
-### 阶段 6 暴露的一个真实缺陷
-
-首次分布式验证出现 **7 条重叠抓取**。根因是崩溃恢复逻辑把所有 inflight
-一律当作「上次崩溃的残留」回收——而新节点加入时，那些条目其实归**正在运行的
-节点**所有。单机场景下这个逻辑是对的（重启时没有其他活跃进程），照搬到分布式
-就成了 bug。
-
-修复方式是引入可见性超时：inflight 记录取出时刻（时间戳统一取自 Redis 服务端
-`TIME`，避免节点间时钟偏差），只回收滞留超过阈值的条目。修复后重叠归零。
-
-这正是阶段 6 存在的意义——用一个真实的分布式实现去反向检验抽象。结论是：
-**`BaseScheduler` 接口本身经受住了检验**（三种实现零改动通过同一组契约测试），
-但**引擎的结束判定策略**需要为分布式补一个 `idle_timeout`：共享队列瞬时为空是
-常态（别的节点正在解析页面），不能一看到空就收工。
+7. **A visibility timeout separates "alive" from "dead"** (`scheduler/redis_backend.py`)
+   Reclaiming every leftover inflight entry on restart is safe on a single machine,
+   but doing the same thing when distributed steals requests other nodes are still
+   working on. See the verification log below.
 
 ---
 
-## 测试
+## Verification log
+
+Every stage was verified against real targets, not just stubs.
+
+**Full crawl of a static site** (`books.toscrape.com`)
+```
+1050 requests | 1050 responses | 0 failures | 1000 items | 34.5s
+```
+1050 requests = 50 listing pages + 1000 detail pages, exactly matching the site
+structure; all 1000 records have unique URLs and UPCs, spanning 50 categories.
+
+**Hybrid downloader A/B** (`quotes.toscrape.com/js`, content generated purely by JS)
+```
+Same URL, same 200 response, only renderer changed:
+  renderer='http'     →   0 items
+  renderer='browser'  →  10 items
+```
+
+**Consistency across four database backends**: the same batch written to SQLite /
+PostgreSQL / MySQL / MongoDB and read back matches exactly; re-running leaves the
+count unchanged, so UPSERT is idempotent. PG/MySQL/Mongo were tested against
+throwaway Docker containers, not mocks.
+
+**Graceful shutdown**: with the batch threshold set to 100000 (far above the crawl
+size), SIGINT after 6 seconds still left 48 rows in the file — proof the buffer
+really is flushed and an interrupt loses nothing.
+
+**Resumable crawl**: interrupted, then continued with `--resume`; 74 rows total
+across both runs with 0 duplicates, so the dedup table survives across processes.
+
+**Distributed**: two independent processes sharing a Redis queue crawled the whole site
+```
+node A 509 items + node B 491 items = 1000 items, 0 overlap
+1050 total requests = 1050 total responses (nothing downloaded twice)
+```
+
+### A real defect exposed by stage 6
+
+The first distributed run produced **7 overlapping fetches**. The root cause was
+crash-recovery logic that treated every inflight entry as "leftovers from the last
+crash" — but when a new node joins, those entries actually belong to a **node that
+is still running**. The logic is correct for a single machine (nothing else is
+alive during a restart); carried over to a distributed setting it became a bug.
+
+The fix was a visibility timeout: inflight entries record when they were taken
+(timestamps all come from the Redis server's `TIME` to avoid clock skew between
+nodes), and only entries stuck past the threshold get reclaimed. Overlap dropped
+to zero afterwards.
+
+This is exactly why stage 6 exists — using a real distributed implementation to
+test the abstraction in reverse. The conclusion: **the `BaseScheduler` interface
+itself held up** (all three implementations pass the same contract tests with zero
+changes), but **the engine's termination policy** needed an `idle_timeout` for the
+distributed case. A shared queue being momentarily empty is normal — another node
+is busy parsing a page — so you cannot call it a day the moment you see an empty
+queue.
+
+---
+
+## Tests
 
 ```
-206 个用例（外部服务齐备时）/ 188 个（纯净环境，其余自动跳过）
+206 cases (with all external services available) / 188 (clean environment, the rest skip)
 ```
 
-| 文件 | 覆盖 |
+| File | Coverage |
 |---|---|
-| `test_models.py` | URL 规范化、指纹、序列化往返 |
-| `test_scheduler.py` / `test_scheduler_sqlite.py` | 优先级、去重、ack、崩溃恢复 |
-| `test_scheduler_contract.py` | **同一组断言跑在三种调度器上** |
-| `test_scheduler_redis.py` | 可见性超时、多节点分工 |
-| `test_middleware.py` | 链顺序、重试、限速、robots、代理 |
-| `test_downloader.py` | 路由分发；真实 Chromium 渲染 |
-| `test_engine.py` | 结束判定、去重、故障隔离 |
-| `test_integration.py` | 真实 TCP 上的重试与限速 |
-| `test_storage*.py` | 六种后端、类型推断、UPSERT |
-| `test_settings.py` | 配置四层合并 |
+| `test_models.py` | URL normalization, fingerprints, serialization round-trips |
+| `test_scheduler.py` / `test_scheduler_sqlite.py` | Priority, dedup, ack, crash recovery |
+| `test_scheduler_contract.py` | **One set of assertions run against all three schedulers** |
+| `test_scheduler_redis.py` | Visibility timeout, work splitting across nodes |
+| `test_middleware.py` | Chain order, retry, throttling, robots, proxy |
+| `test_downloader.py` | Route dispatch; real Chromium rendering |
+| `test_engine.py` | Termination detection, dedup, failure isolation |
+| `test_integration.py` | Retry and throttling over real TCP |
+| `test_storage*.py` | Six backends, type inference, UPSERT |
+| `test_settings.py` | Four-layer config merge |
 
-契约测试是这套测试里分量最重的一个：如果某个调度器实现需要特殊对待才能通过，
-就说明抽象没做对。
+The contract tests carry the most weight here: if any scheduler implementation
+needed special treatment to pass, that would mean the abstraction is wrong.
 
 ---
 
-## 配置
+## Configuration
 
-优先级由低到高：内置默认 < `settings.toml` 的 `[default]` <
-spider 的 `custom_settings` < `settings.toml` 的 `[spider.<名字>]` < 命令行。
+Lowest to highest precedence: built-in defaults < `[default]` in `settings.toml` <
+a spider's `custom_settings` < `[spider.<name>]` in `settings.toml` < command line.
 
-第 3 层与第 4 层的先后是刻意的：`custom_settings` 是爬虫作者写在代码里的默认值，
-而 toml 里的专属段属于运维侧调整，调线上行为不必改代码。
+Layers 3 and 4 are in that order deliberately: `custom_settings` is the default the
+spider author wrote into the code, while the dedicated section in the toml belongs
+to the operations side — adjusting production behavior should not require a code change.
 
 ```toml
 [default]
 concurrency = 16
-download_delay = 1.0      # 默认偏保守
+download_delay = 1.0      # conservative by default
 respect_robots = true
 
 [spider.books]
@@ -275,6 +294,7 @@ concurrency = 8
 download_delay = 0.1
 ```
 
-> 默认开启 robots.txt 遵守，默认间隔 1 秒/域名。示例爬虫针对
-> `toscrape.com`（专为爬虫练习搭建、无 robots.txt 限制）放宽到 0.1 秒；
-> 抓取生产站点时建议保留保守默认值。
+> robots.txt is respected by default, with a 1 second per-domain delay. The example
+> spiders relax that to 0.1s for `toscrape.com` (a site built specifically for
+> scraping practice, with no robots.txt restrictions); keep the conservative
+> defaults when crawling production sites.
