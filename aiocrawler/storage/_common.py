@@ -8,8 +8,42 @@
 from __future__ import annotations
 
 import json
+import re
 from enum import Enum
 from typing import Any, Iterable
+
+#: 只能出现在 SQL 关键字位置（如 CHARSET=）的取值，无法用引号包起来，
+#: 只能走白名单
+_BARE_WORD = re.compile(r"^[A-Za-z0-9_]+$")
+
+
+def quote_ident(name: str, quote: str = '"') -> str:
+    """把表名 / 列名安全地包进引号。
+
+    **只加引号是不够的。** 名字里本身带一个引号，就能把我们加的引号提前闭合，
+    后面的内容随即变成新的 SQL 片段——表名、列名这类标识符没法用占位符传参，
+    所以它是 f-string 拼 SQL 时唯一的注入入口。asyncpg 的 execute() 在不带参数
+    时按脚本执行多条语句，注入在 PostgreSQL 上就是完整的堆叠查询。
+
+    SQL 标准的转义方式是把引号本身重复一次（`a"b` → `"a""b"`）；PostgreSQL 与
+    SQLite 用双引号，MySQL 用反引号，规则相同。NUL 字节会让不少驱动直接截断
+    语句，无法可靠转义，一律拒绝。
+    """
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"SQL 标识符不能为空：{name!r}")
+    if "\x00" in name:
+        raise ValueError(f"SQL 标识符不能包含 NUL 字节：{name!r}")
+    return f"{quote}{name.replace(quote, quote * 2)}{quote}"
+
+
+def check_bare_word(value: str, *, field: str) -> str:
+    """校验只能裸写进 SQL 的取值（字符集名等），不合规直接拒绝。"""
+    if not isinstance(value, str) or not _BARE_WORD.match(value):
+        raise ValueError(
+            f"{field} 只允许字母、数字和下划线，收到 {value!r}——"
+            "该取值会被直接拼进 SQL，无法用引号或占位符保护"
+        )
+    return value
 
 
 class ColumnType(str, Enum):

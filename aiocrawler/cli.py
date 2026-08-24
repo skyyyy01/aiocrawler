@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -28,7 +29,20 @@ from aiocrawler.storage import storage_from_uri
 app = typer.Typer(add_completion=False, help="aiocrawler —— 异步爬虫框架")
 
 
+#: 爬虫名会被拼进状态文件路径，必须挡掉 ../ 之类的穿越写法
+_SAFE_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
 def _state_path(name: str) -> Path:
+    """状态文件路径。
+
+    name 来自命令行，直接拼进路径会让 `aiocrawler state ../../x --clear`
+    删到 out/ 之外的文件，因此这里先做字符白名单校验。
+    """
+    if not _SAFE_NAME.match(name) or name in (".", ".."):
+        raise typer.BadParameter(
+            f"爬虫名 {name!r} 含有非法字符，只允许字母、数字、下划线、点和连字符"
+        )
     return Path("out") / f"{name}.state.db"
 
 
@@ -107,11 +121,12 @@ def run_spider(
 
     out_path = output or settings.output.format(spider=name)
     storage_kwargs = dict(settings.storage_options)
-    if resume and not fresh and out_path.endswith(".jsonl"):
-        # JSONL 默认覆盖写，续爬时必须改成追加，否则上一轮的结果会被清掉。
-        # 数据库后端靠 unique_key 的 UPSERT 保证幂等，无需特殊处理。
-        storage_kwargs.setdefault("append", True)
-    storage = storage_from_uri(out_path, **storage_kwargs)
+    # 续爬时文件类后端必须改成追加：默认的覆盖写会清空上一轮结果，而指纹库
+    # 又拦着不让重抓，数据就永久没了。按后端能力判断而不是看文件后缀——
+    # 后缀判断会漏掉 .json / .txt / 无后缀这些同样落到 JsonlStorage 的路径。
+    # 数据库后端靠 unique_key 的 UPSERT 保证幂等，storage_from_uri 会忽略该参数。
+    append = True if (resume or redis) and not fresh else None
+    storage = storage_from_uri(out_path, append=append, **storage_kwargs)
 
     scheduler = None
     if redis:

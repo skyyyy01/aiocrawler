@@ -15,7 +15,13 @@ from typing import Any
 
 import structlog
 
-from aiocrawler.storage._common import ColumnType, infer_schema, normalize_rows
+from aiocrawler.storage._common import (
+    ColumnType,
+    check_bare_word,
+    infer_schema,
+    normalize_rows,
+    quote_ident,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -26,6 +32,12 @@ class _SqlStorageBase:
     TYPES: dict[ColumnType, str] = {}
     #: 作为唯一键时必须替换成的类型（MySQL 的 TEXT 不能建唯一索引）
     KEY_TYPE: str | None = None
+    #: 本后端的标识符引号：PostgreSQL 用双引号，MySQL 用反引号
+    QUOTE: str = '"'
+
+    def _ident(self, name: str) -> str:
+        """转义标识符。表名、唯一键都来自配置，不能直接拼进 SQL。"""
+        return quote_ident(name, self.QUOTE)
 
     def __init__(
         self,
@@ -97,33 +109,40 @@ class PostgresStorage(_SqlStorageBase):
     async def _ensure_table(self, rows: list[dict[str, Any]]) -> None:
         defs = self._column_defs(rows)
         self._columns = list(defs)
-        cols_sql = ", ".join(f'"{n}" {t}' for n, t in defs.items())
+        table = self._ident(self._table)
+        cols_sql = ", ".join(f"{self._ident(n)} {t}" for n, t in defs.items())
         async with self._pool.acquire() as conn:
-            await conn.execute(f'CREATE TABLE IF NOT EXISTS "{self._table}" ({cols_sql})')
+            await conn.execute(f"CREATE TABLE IF NOT EXISTS {table} ({cols_sql})")
             if self._keys:
-                keys = ", ".join(f'"{k}"' for k in self._keys)
+                keys = ", ".join(self._ident(k) for k in self._keys)
+                index = self._ident(f"ux_{self._table}")
                 await conn.execute(
-                    f'CREATE UNIQUE INDEX IF NOT EXISTS "ux_{self._table}" '
-                    f'ON "{self._table}" ({keys})'
+                    f"CREATE UNIQUE INDEX IF NOT EXISTS {index} ON {table} ({keys})"
                 )
         self._ready = True
         log.debug("postgres_table_ready", table=self._table, columns=len(defs))
 
     async def write(self, rows: list[dict[str, Any]]) -> None:
-        if not rows or self._pool is None:
+        if not rows:
             return
+        if self._pool is None:
+            # 静默 return 会让 open() 失败这类问题在很久以后才暴露：
+            # 爬虫一路跑完、日志一片正常，最后发现一条数据都没落地
+            raise RuntimeError(f"{type(self).__name__} 未打开，请先 await open()")
         if not self._ready:
             await self._ensure_table(rows)
 
-        cols_sql = ", ".join(f'"{c}"' for c in self._columns)
+        cols_sql = ", ".join(self._ident(c) for c in self._columns)
         placeholders = ", ".join(f"${i}" for i in range(1, len(self._columns) + 1))
-        sql = f'INSERT INTO "{self._table}" ({cols_sql}) VALUES ({placeholders})'
+        sql = f"INSERT INTO {self._ident(self._table)} ({cols_sql}) VALUES ({placeholders})"
 
         if self._keys:
             updates = ", ".join(
-                f'"{c}"=EXCLUDED."{c}"' for c in self._columns if c not in self._keys
+                f"{self._ident(c)}=EXCLUDED.{self._ident(c)}"
+                for c in self._columns
+                if c not in self._keys
             )
-            conflict = ", ".join(f'"{k}"' for k in self._keys)
+            conflict = ", ".join(self._ident(k) for k in self._keys)
             sql += (
                 f" ON CONFLICT ({conflict}) DO UPDATE SET {updates}"
                 if updates
@@ -154,11 +173,13 @@ class MysqlStorage(_SqlStorageBase):
     }
     # TEXT 列无法直接建唯一索引，唯一键一律用定长 VARCHAR
     KEY_TYPE = "VARCHAR(255)"
+    QUOTE = "`"
 
     def __init__(self, dsn: str, *, pool_size: int = 5, charset: str = "utf8mb4", **kw: Any) -> None:
         super().__init__(dsn, **kw)
         self._pool_size = pool_size
-        self._charset = charset
+        # charset 出现在 SQL 的关键字位置，包不了引号，只能走白名单
+        self._charset = check_bare_word(charset, field="charset")
         self._pool: Any = None
 
     @staticmethod
@@ -189,39 +210,46 @@ class MysqlStorage(_SqlStorageBase):
     async def _ensure_table(self, rows: list[dict[str, Any]]) -> None:
         defs = self._column_defs(rows)
         self._columns = list(defs)
-        cols_sql = ", ".join(f"`{n}` {t}" for n, t in defs.items())
+        cols_sql = ", ".join(f"{self._ident(n)} {t}" for n, t in defs.items())
         if self._keys:
-            keys = ", ".join(f"`{k}`" for k in self._keys)
-            cols_sql += f", UNIQUE KEY `ux_{self._table}` ({keys})"
+            keys = ", ".join(self._ident(k) for k in self._keys)
+            cols_sql += f", UNIQUE KEY {self._ident(f'ux_{self._table}')} ({keys})"
 
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    f"CREATE TABLE IF NOT EXISTS `{self._table}` ({cols_sql}) "
+                    f"CREATE TABLE IF NOT EXISTS {self._ident(self._table)} ({cols_sql}) "
                     f"ENGINE=InnoDB DEFAULT CHARSET={self._charset}"
                 )
         self._ready = True
         log.debug("mysql_table_ready", table=self._table, columns=len(defs))
 
     async def write(self, rows: list[dict[str, Any]]) -> None:
-        if not rows or self._pool is None:
+        if not rows:
             return
+        if self._pool is None:
+            # 静默 return 会让 open() 失败这类问题在很久以后才暴露：
+            # 爬虫一路跑完、日志一片正常，最后发现一条数据都没落地
+            raise RuntimeError(f"{type(self).__name__} 未打开，请先 await open()")
         if not self._ready:
             await self._ensure_table(rows)
 
-        cols_sql = ", ".join(f"`{c}`" for c in self._columns)
+        cols_sql = ", ".join(self._ident(c) for c in self._columns)
         placeholders = ", ".join(["%s"] * len(self._columns))
-        sql = f"INSERT INTO `{self._table}` ({cols_sql}) VALUES ({placeholders})"
+        sql = f"INSERT INTO {self._ident(self._table)} ({cols_sql}) VALUES ({placeholders})"
 
         if self._keys:
             updates = ", ".join(
-                f"`{c}`=VALUES(`{c}`)" for c in self._columns if c not in self._keys
+                f"{self._ident(c)}=VALUES({self._ident(c)})"
+                for c in self._columns
+                if c not in self._keys
             )
             if updates:
                 sql += f" ON DUPLICATE KEY UPDATE {updates}"
             else:
                 # 没有非键列可更新时，用自赋值实现「存在即跳过」
-                sql += f" ON DUPLICATE KEY UPDATE `{self._keys[0]}`=`{self._keys[0]}`"
+                key = self._ident(self._keys[0])
+                sql += f" ON DUPLICATE KEY UPDATE {key}={key}"
 
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cur:

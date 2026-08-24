@@ -80,10 +80,29 @@ class Request:
         return h.hexdigest()
 
     def replace(self, **changes: Any) -> Request:
-        """派生一个修改过部分字段的新 Request（中间件常用）。"""
+        """派生一个修改过部分字段的新 Request（中间件常用）。
+
+        meta 与 headers 会被复制一份。dataclasses.replace 只做浅拷贝，派生出的
+        请求会和原请求共享同一个 dict——重试请求改一下 header，原请求跟着变；
+        原请求被 ack 时从 meta 里摘掉记账字段，重试请求也跟着少一块。这类
+        「改了 A 结果 B 变了」的问题在并发下极难排查。
+        """
+        changes.setdefault("meta", dict(self.meta))
+        changes.setdefault("headers", dict(self.headers))
         return _dc_replace(self, **changes)
 
     # ---- 序列化：分布式调度器的接口基础 ----
+
+    def public_meta(self) -> dict[str, Any]:
+        """剔除框架内部记账字段后的 meta。
+
+        下划线开头的键是各组件的运行期便签（调度器行号、Redis member、
+        自动分配的代理……），只在本次处理内有效。把它们一起序列化进队列会带来
+        实打实的麻烦：Redis 的 member 里存着整条 payload，跟着重试再序列化一次
+        就层层嵌套，请求体每重试一轮膨胀一截；自动分配的代理则会把账号密码
+        原样写进队列存储。
+        """
+        return {k: v for k, v in self.meta.items() if not k.startswith("_")}
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -92,7 +111,7 @@ class Request:
             "method": self.method,
             "headers": self.headers,
             "body": self.body.decode("latin-1") if self.body else None,
-            "meta": self.meta,
+            "meta": self.public_meta(),
             "priority": self.priority,
             "renderer": self.renderer,
             "dont_filter": self.dont_filter,

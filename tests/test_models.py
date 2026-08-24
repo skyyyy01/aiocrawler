@@ -98,3 +98,46 @@ class TestResponse:
         req = Request("http://a.com/", meta={"depth": 2})
         resp = Response(url="http://a.com/", status=200, headers={}, body=b"", request=req)
         assert resp.meta["depth"] == 2
+
+
+class TestReplaceIsolation:
+    """回归：replace() 曾与原请求共享 meta / headers 这两个 dict。"""
+
+    def test_meta_and_headers_are_copied(self):
+        original = Request("https://x.com", meta={"page": 1}, headers={"A": "1"})
+        derived = original.replace(retries=1)
+
+        derived.meta["page"] = 99
+        derived.headers["A"] = "changed"
+        # 改派生请求不能反过来影响原请求，否则「重试改个 header
+        # 结果原请求跟着变」这类问题在并发下根本查不出来
+        assert original.meta == {"page": 1}
+        assert original.headers == {"A": "1"}
+
+    def test_explicit_meta_still_wins(self):
+        original = Request("https://x.com", meta={"page": 1})
+        assert original.replace(meta={"page": 2}).meta == {"page": 2}
+
+
+class TestInternalMetaNotSerialized:
+    """回归：下划线开头的内部记账字段不得写进队列 payload。"""
+
+    def test_internal_keys_stripped(self):
+        r = Request("https://x.com", meta={"page": 3, "_queue_id": 7})
+        assert r.to_dict()["meta"] == {"page": 3}
+        assert Request.from_json(r.to_json()).meta == {"page": 3}
+
+    def test_redis_member_does_not_nest(self):
+        """Redis 的 member 里存着整条 payload，跟着重试再序列化就会层层嵌套。"""
+        r = Request("https://example.com/a")
+        sizes = []
+        for i in range(5):
+            r.meta["_redis_member"] = f"{i}|{r.to_json()}"
+            r = r.replace(retries=r.retries + 1, dont_filter=True)
+            sizes.append(len(r.to_json()))
+        # 每轮大小应当持平，而不是滚雪球
+        assert max(sizes) - min(sizes) < 20, sizes
+
+    def test_auto_proxy_credentials_not_persisted(self):
+        r = Request("https://x.com", meta={"_proxy": "http://user:secret@p:8080"})
+        assert "secret" not in r.to_json()

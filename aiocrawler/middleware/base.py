@@ -109,5 +109,13 @@ class MiddlewareManager:
             result = await mw.process_response(request, response)
             if isinstance(result, Request):
                 return result
+            if result is None:
+                # process_response 忘了 return 是很常见的笔误。放任 None 传下去，
+                # 引擎会把它当作「请求已被放弃」，于是这个页面被静默丢掉——
+                # 没有报错，只是数据莫名其妙少了一页
+                raise TypeError(
+                    f"{type(mw).__name__}.process_response() 返回了 None；"
+                    "它必须返回 Response 或 Request（放行时请 return response）"
+                )
             response = result
         return response

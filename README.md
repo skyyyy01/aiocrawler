@@ -24,7 +24,7 @@ on top of `asyncio` + `httpx` — no Scrapy dependency.
 
 ```bash
 # Install (optional groups as needed)
-.venv/bin/pip install -e ".[dev,browser,sqlite,postgres,mysql,mongo]"
+.venv/bin/pip install -e ".[dev,browser,sqlite,postgres,mysql,mongo,redis]"
 .venv/bin/playwright install chromium        # only for browser rendering
 
 .venv/bin/python -m aiocrawler list          # list spiders

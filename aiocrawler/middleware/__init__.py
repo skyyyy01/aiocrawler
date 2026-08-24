@@ -49,7 +49,11 @@ def build_default_middlewares(settings: Settings) -> list[Middleware]:
     ]
 
     if settings.respect_robots:
-        middlewares.append(RobotsMiddleware())
+        # robots.txt 也要走代理、也要遵守证书校验，否则它会成为绕过全局
+        # 网络配置的旁路，每抓一个新站点就泄露一次真实 IP
+        middlewares.append(
+            RobotsMiddleware(proxy=settings.proxy, verify_ssl=settings.verify_ssl)
+        )
 
     middlewares.append(UserAgentMiddleware(settings.user_agents))
 

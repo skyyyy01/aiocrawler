@@ -23,7 +23,7 @@
 
 ```bash
 # 安装（按需选装可选组）
-.venv/bin/pip install -e ".[dev,browser,sqlite,postgres,mysql,mongo]"
+.venv/bin/pip install -e ".[dev,browser,sqlite,postgres,mysql,mongo,redis]"
 .venv/bin/playwright install chromium        # 仅浏览器渲染需要
 
 .venv/bin/python -m aiocrawler list          # 列出爬虫

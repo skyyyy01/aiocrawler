@@ -14,7 +14,12 @@ from typing import Any
 
 import structlog
 
-from aiocrawler.storage._common import ColumnType, infer_schema, normalize_rows
+from aiocrawler.storage._common import (
+    ColumnType,
+    infer_schema,
+    normalize_rows,
+    quote_ident,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -64,23 +69,32 @@ class SqliteStorage:
 
     async def _create_table(self, columns: dict[str, str]) -> None:
         self._columns = list(columns)
-        cols_sql = ", ".join(f'"{name}" {sql_type}' for name, sql_type in columns.items())
-        await self._conn.execute(f'CREATE TABLE IF NOT EXISTS "{self._table}" ({cols_sql})')
+        table = quote_ident(self._table)
+        cols_sql = ", ".join(
+            f"{quote_ident(name)} {sql_type}" for name, sql_type in columns.items()
+        )
+        await self._conn.execute(f"CREATE TABLE IF NOT EXISTS {table} ({cols_sql})")
 
         if self._keys:
-            key_sql = ", ".join(f'"{k}"' for k in self._keys)
+            key_sql = ", ".join(quote_ident(k) for k in self._keys)
             # UPSERT 依赖唯一索引，没有它 ON CONFLICT 无从判断冲突
             await self._conn.execute(
-                f'CREATE UNIQUE INDEX IF NOT EXISTS "ux_{self._table}" '
-                f'ON "{self._table}" ({key_sql})'
+                f"CREATE UNIQUE INDEX IF NOT EXISTS {quote_ident(f'ux_{self._table}')} "
+                f"ON {table} ({key_sql})"
             )
         await self._conn.commit()
         self._ready = True
         log.debug("sqlite_table_ready", table=self._table, columns=len(columns))
 
     async def write(self, rows: list[dict[str, Any]]) -> None:
-        if not rows or self._conn is None:
+        if not rows:
             return
+        if self._conn is None:
+            # 静默 return 会让 open() 失败这类问题在很久以后才暴露：
+            # 爬虫一路跑完、日志一片正常，最后发现一条数据都没落地
+            raise RuntimeError(
+                f"{type(self).__name__} 未打开，请先 await open()"
+            )
 
         if not self._ready:
             inferred = infer_schema(rows)
@@ -88,14 +102,16 @@ class SqliteStorage:
 
         prepared = normalize_rows(rows, self._columns)
         placeholders = ", ".join("?" for _ in self._columns)
-        cols_sql = ", ".join(f'"{c}"' for c in self._columns)
-        sql = f'INSERT INTO "{self._table}" ({cols_sql}) VALUES ({placeholders})'
+        cols_sql = ", ".join(quote_ident(c) for c in self._columns)
+        sql = f"INSERT INTO {quote_ident(self._table)} ({cols_sql}) VALUES ({placeholders})"
 
         if self._keys:
             updates = ", ".join(
-                f'"{c}"=excluded."{c}"' for c in self._columns if c not in self._keys
+                f"{quote_ident(c)}=excluded.{quote_ident(c)}"
+                for c in self._columns
+                if c not in self._keys
             )
-            conflict = ", ".join(f'"{k}"' for k in self._keys)
+            conflict = ", ".join(quote_ident(k) for k in self._keys)
             sql += (
                 f" ON CONFLICT({conflict}) DO UPDATE SET {updates}"
                 if updates

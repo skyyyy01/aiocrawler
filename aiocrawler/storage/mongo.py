@@ -45,8 +45,13 @@ class MongoStorage:
         self._coll = self._client[self._db_name][self._coll_name]
 
         if self._keys:
+            # 索引名带上键名：写死一个名字的话，改了 unique_key 再跑就会撞上
+            # IndexOptionsConflict（同名索引、不同键），且报错跟 unique_key
+            # 毫无字面关联，很难看出是怎么回事
             await self._coll.create_index(
-                [(k, 1) for k in self._keys], unique=True, name="ux_items"
+                [(k, 1) for k in self._keys],
+                unique=True,
+                name="ux_" + "_".join(self._keys),
             )
         log.debug(
             "mongo_ready",
@@ -56,8 +61,14 @@ class MongoStorage:
         )
 
     async def write(self, rows: list[dict[str, Any]]) -> None:
-        if not rows or self._coll is None:
+        if not rows:
             return
+        if self._coll is None:
+            # 静默 return 会让 open() 失败这类问题在很久以后才暴露：
+            # 爬虫一路跑完、日志一片正常，最后发现一条数据都没落地
+            raise RuntimeError(
+                f"{type(self).__name__} 未打开，请先 await open()"
+            )
 
         if not self._keys:
             # ordered=False：单条失败不影响这一批的其余文档
@@ -66,11 +77,24 @@ class MongoStorage:
 
         from pymongo import ReplaceOne
 
-        ops = [
-            ReplaceOne({k: doc.get(k) for k in self._keys}, doc, upsert=True)
-            for doc in rows
-        ]
+        # filter 的取值来自抓取内容。若某个键的值是 dict，它会被 MongoDB 当作
+        # 查询表达式解释（`{"$ne": null}` 之类），upsert 就可能命中并覆盖掉
+        # 一条毫不相干的文档。唯一键只接受标量。
+        ops = [ReplaceOne(self._key_filter(doc), doc, upsert=True) for doc in rows]
         await self._coll.bulk_write(ops, ordered=False)
+
+    def _key_filter(self, doc: dict[str, Any]) -> dict[str, Any]:
+        """用唯一键的取值构造 upsert 条件，拒绝非标量。"""
+        keys: dict[str, Any] = {}
+        for k in self._keys:
+            value = doc.get(k)
+            if isinstance(value, (dict, list)):
+                raise ValueError(
+                    f"唯一键 {k!r} 的取值是 {type(value).__name__}，"
+                    "会被 MongoDB 当成查询表达式解释——请改用标量字段作唯一键"
+                )
+            keys[k] = value
+        return keys
 
     async def close(self) -> None:
         if self._client is not None:

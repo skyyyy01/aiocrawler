@@ -17,6 +17,7 @@ import respx
 
 from aiocrawler import BaseSpider, Item, Response
 from aiocrawler.engine import Engine
+from aiocrawler.scheduler.memory import MemoryScheduler
 from aiocrawler.settings import Settings
 from tests.conftest import CollectPipeline
 
@@ -172,3 +173,76 @@ async def test_custom_settings_merged_into_engine():
     engine = build()
     assert engine.settings.concurrency == 4      # 来自 custom_settings
     assert engine.settings.timeout == 20.0       # 未覆盖，保持默认
+
+
+class TestShutdownIsResilient:
+    """回归：_shutdown 曾经顺序执行且不兜异常——某一步抛错，后面的组件
+    （调度器连接、spider 收尾钩子）就再也轮不到，资源直接泄漏。"""
+
+    class _Tracker:
+        def __init__(self, fail: bool = False):
+            self.fail = fail
+            self.closed = False
+
+        async def open(self) -> None: ...
+        async def start(self) -> None: ...
+        async def push(self, request) -> bool: return True
+        async def pop(self): return None
+        async def ack(self, request) -> None: ...
+        async def size(self) -> int: return 0
+        async def fetch(self, request): raise AssertionError("不应被调用")
+
+        async def close(self) -> None:
+            if self.fail:
+                raise RuntimeError("关闭失败")
+            self.closed = True
+
+    async def test_later_components_still_close(self):
+        scheduler = self._Tracker()
+        downloader = self._Tracker(fail=True)
+        spider = DemoSpider()
+        closed = []
+
+        async def _record_close():
+            closed.append(True)
+
+        spider.on_close = _record_close
+
+        engine = Engine(
+            spider,
+            Settings(stats_interval=3600.0),
+            scheduler=scheduler,
+            downloader=downloader,
+            pipelines=[],
+            middlewares=[],
+        )
+        await engine.run()
+
+        # 下载器关闭失败，但调度器和 spider 的收尾都不能被跳过
+        assert scheduler.closed
+        assert closed == [True]
+
+
+class TestAckFailureIsolation:
+    """回归：ack 抛错会逃出 worker，TaskGroup 随即取消所有其他 worker——
+    一次数据库抖动就把整轮抓取掐断了。"""
+
+    class _AckFails(MemoryScheduler):
+        async def ack(self, request) -> None:
+            raise RuntimeError("状态库瞬时不可用")
+
+    @respx.mock
+    async def test_crawl_completes_despite_ack_errors(self):
+        mock_site()
+        collector = CollectPipeline()
+        engine = Engine(
+            DemoSpider(),
+            Settings(stats_interval=3600.0),
+            scheduler=self._AckFails(),
+            pipelines=[collector],
+            middlewares=[],
+        )
+        stats = await engine.run()
+
+        assert len(collector.items) == 4          # 数据一条不少
+        assert stats.get("request/ack_failed") > 0

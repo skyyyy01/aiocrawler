@@ -19,15 +19,25 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 
 class Settings(BaseModel):
     model_config = {"extra": "forbid"}
 
+    #: 这份配置是否已在外层（load_settings）叠加过 spider.custom_settings。
+    #: Engine 据此避免二次合并——二次合并会让 custom_settings 反超 [spider.x]
+    #: 与命令行参数，把文档里定下的优先级整个颠倒过来。
+    _custom_applied: bool = PrivateAttr(default=False)
+
     # ---- 并发 ----
     concurrency: int = Field(default=16, ge=1, description="全局并发 worker 数")
-    concurrency_per_domain: int = Field(default=8, ge=1, description="单域名并发上限")
+    #: **当前尚未实现**，设置它不会有任何效果。同域名的请求速率实际由
+    #: download_delay 控制（ThrottleMiddleware 会把同域名请求串行化）。
+    #: 保留该字段是为了不让已有 settings.toml 因 extra="forbid" 而报错。
+    concurrency_per_domain: int = Field(
+        default=8, ge=1, description="单域名并发上限（尚未实现，请用 download_delay）"
+    )
 
     # ---- 下载 ----
     timeout: float = Field(default=20.0, gt=0)
@@ -36,6 +46,9 @@ class Settings(BaseModel):
     verify_ssl: bool = True
     default_headers: dict[str, str] = Field(default_factory=dict)
     proxy: str | None = None
+    #: 单个响应体的字节上限，None 表示不限。对端返回多大完全由它决定，
+    #: 不设限就等于把进程的内存交给被抓站点支配
+    max_response_bytes: int | None = Field(default=64 * 1024 * 1024, gt=0)
 
     # ---- 礼貌抓取（默认保守，避免给目标站点造成压力）----
     download_delay: float = Field(default=1.0, ge=0, description="同域名两次请求的最小间隔（秒）")
@@ -87,11 +100,28 @@ class Settings(BaseModel):
     #: 立即退出会导致节点提前离场。
     idle_timeout: float = Field(default=0.0, ge=0)
 
-    def merged(self, overrides: dict[str, Any] | None) -> Settings:
-        """叠加一层覆盖配置，返回新实例（不修改原对象）。"""
-        if not overrides:
+    @property
+    def custom_settings_applied(self) -> bool:
+        """custom_settings 这一层是否已经被外层处理过。"""
+        return self._custom_applied
+
+    def merged(
+        self,
+        overrides: dict[str, Any] | None,
+        *,
+        applies_custom_settings: bool = False,
+    ) -> Settings:
+        """叠加一层覆盖配置，返回新实例（不修改原对象）。
+
+        :param applies_custom_settings: 本次叠加的就是 spider.custom_settings。
+            置位后 Engine 不会再合并一次，从而保证 [spider.x] 与命令行参数
+            始终排在 custom_settings 之上。
+        """
+        if not overrides and not applies_custom_settings:
             return self
-        return Settings(**{**self.model_dump(), **overrides})
+        merged = Settings(**{**self.model_dump(), **(overrides or {})})
+        merged._custom_applied = self._custom_applied or applies_custom_settings
+        return merged
 
 
 DEFAULT_CONFIG_FILE = "settings.toml"
@@ -127,7 +157,9 @@ def load_settings(
     config = read_config_file(config_file)
 
     settings = Settings(**config.get("default", {}))
-    settings = settings.merged(custom_settings)
+    # 即使 custom_settings 为空也要置位：这一层的归属已经由本函数认领，
+    # Engine 不该再插手
+    settings = settings.merged(custom_settings, applies_custom_settings=True)
 
     if spider_name:
         settings = settings.merged(config.get("spider", {}).get(spider_name))

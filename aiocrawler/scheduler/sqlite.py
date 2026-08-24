@@ -101,15 +101,22 @@ class SqliteScheduler:
     # -------------------------------------------------------------- 队列
 
     async def push(self, request: Request) -> bool:
-        if not request.dont_filter:
-            if await self.seen(request.fingerprint()):
-                await self._conn.commit()
-                return False
+        # 指纹登记与入队必须同进同退。sqlite3 在 DML 上隐式开启事务，若两条语句
+        # 之间抛错而不回滚，那条已登记的指纹会被**下一次** push 的 commit 顺带
+        # 提交——留下一个「已标记抓过但从未入队」的空洞，且毫无迹象
+        try:
+            if not request.dont_filter:
+                if await self.seen(request.fingerprint()):
+                    await self._conn.commit()
+                    return False
 
-        await self._conn.execute(
-            "INSERT INTO queue (priority, status, payload) VALUES (?, 0, ?)",
-            (request.priority, request.to_json()),
-        )
+            await self._conn.execute(
+                "INSERT INTO queue (priority, status, payload) VALUES (?, 0, ?)",
+                (request.priority, request.to_json()),
+            )
+        except BaseException:
+            await self._conn.rollback()
+            raise
         await self._conn.commit()
         return True
 

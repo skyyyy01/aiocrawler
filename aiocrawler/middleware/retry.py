@@ -8,8 +8,10 @@
 2. **退避要加随机抖动**。大量请求同时失败（如目标站点短暂 503）时，若退避间隔
    完全一致，重试会在同一时刻再次涌向服务器，形成惊群。抖动把它们摊开。
 
-429 / 503 若带 Retry-After 头，一律以服务端给的时间为准——这是对方明确告知的
-恢复时间，比我们自己算的退避更准确。
+429 / 503 若带 Retry-After 头，优先采用服务端给的时间——这是对方明确告知的
+恢复时间，比我们自己算的退避更准确。但**必须夹在 max_backoff 以内**：这个值
+完全由服务端控制，一个 `Retry-After: 86400` 就能让 worker 睡满一天。并发 N 的
+爬虫被这么摆一道，整轮抓取就静默挂死了，日志上还看不出任何异常。
 """
 
 from __future__ import annotations
@@ -63,6 +65,15 @@ class RetryMiddleware(Middleware):
         wait = None
         if self._respect_retry_after:
             wait = self._parse_retry_after(response.headers.get("retry-after"))
+            if wait is not None and wait > self._max_backoff:
+                log.warning(
+                    "retry_after_capped",
+                    url=request.url,
+                    requested=round(wait, 1),
+                    capped_to=self._max_backoff,
+                    hint="服务端要求的等待时间超过 max_backoff，已截断",
+                )
+                wait = self._max_backoff
 
         retry = await self._schedule_retry(request, f"HTTP {response.status}", override_delay=wait)
         return retry if retry is not None else response

@@ -11,6 +11,9 @@
     {prefix}:seen      SET    去重指纹
     {prefix}:seq       INT    自增序号，用于 FIFO 与成员唯一
 
+注意 prefix 决定了隔离边界：多个爬虫共用同一个 prefix 会互相消费对方的请求。
+CLI 默认取 `aiocrawler:<爬虫名>`，直接用本类时请自行区分。
+
 ## score 的编码
 
     score = -priority * 10^12 + seq
@@ -28,6 +31,11 @@ ZSET 的成员必须互不相同，而 dont_filter 的请求允许重复入队�
 pop 把成员从 queue 移入 inflight，ack 才真正删除。pop 的「弹出 + 记账」必须
 原子，否则并发消费者会拿到同一条——用 Lua 脚本保证。
 
+push 同样必须原子。BaseScheduler 的契约要求「去重判断 + 入队」是一次操作：
+拆成 SADD → INCR → ZADD 三次往返的话，中间任何一步失败（连接断开、进程被杀）
+都会留下一个「指纹已登记但请求从未入队」的空洞——这条 URL 从此被永久判定为
+已抓过，谁也不会再去抓它，而且没有任何报错。
+
 **关键点：崩溃恢复不能无差别回收所有 inflight。** 单机版（SqliteScheduler）
 重启时不存在其他活跃进程，把残留的 inflight 全部放回队列是安全的。但分布式
 不同：新节点加入时，其他节点正有一批请求在处理中，若把它们全部回收，这些请求
@@ -40,6 +48,7 @@ pop 把成员从 queue 移入 inflight，ack 才真正删除。pop 的「弹出 
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import structlog
@@ -50,6 +59,32 @@ log = structlog.get_logger(__name__)
 
 #: 优先级在 score 中占据的量级，须远大于可能的 seq 取值
 _PRIORITY_SCALE = 10 ** 12
+
+#: ZSET 的 score 是 IEEE-754 双精度，整数只在 2^53 以内精确。
+#: 超出后 seq 位会被抹掉，同优先级的 FIFO 顺序随之失效
+_MAX_EXACT_SCORE = 2 ** 53
+
+#: 与 Redis 服务端时钟的校准间隔（秒）
+_CLOCK_RESYNC = 30.0
+
+# 去重 + 取号 + 入队，一次原子完成。返回 1 表示入队，0 表示被去重丢弃。
+# ARGV[1] 为空串时跳过去重（dont_filter 的请求）。
+#
+# score 与 seq 都必须用 string.format('%d') 显式转成字符串再交给 Redis：
+# Lua 隐式的 number→string 用的是 "%.14g"，只保留 14 位有效数字，而 score
+# 最大能到 10^15 量级——隐式转换会把末尾的 seq 位直接抹平，同优先级请求的
+# 先进先出顺序随之失效，member 名字也会变成 "1e+15" 这种科学计数法。
+_PUSH_LUA = """
+local fp = ARGV[1]
+if fp ~= '' and redis.call('SADD', KEYS[1], fp) == 0 then
+    return 0
+end
+local seq    = redis.call('INCR', KEYS[2])
+local score  = -tonumber(ARGV[3]) * tonumber(ARGV[4]) + seq
+local member = string.format('%d', seq) .. '|' .. ARGV[2]
+redis.call('ZADD', KEYS[3], string.format('%d', score), member)
+return 1
+"""
 
 # 弹出最小 score 的成员，同时以 "score:取出时刻" 记入 inflight。原子执行。
 _POP_LUA = """
@@ -75,9 +110,11 @@ for i = 1, #entries, 2 do
     local value  = entries[i + 1]
     local sep    = string.find(value, ':', 1, true)
     if sep then
-        local score = tonumber(string.sub(value, 1, sep - 1))
+        -- score 原样保留字符串形式再塞回 ZADD：转成 number 又隐式转回字符串
+        -- 会走 "%.14g"，把高优先级请求的 seq 位抹掉（见 _PUSH_LUA 的注释）
+        local score = string.sub(value, 1, sep - 1)
         local taken = tonumber(string.sub(value, sep + 1))
-        if score and taken and (now - taken) > timeout then
+        if tonumber(score) and taken and (now - taken) > timeout then
             redis.call('ZADD', KEYS[1], score, member)
             redis.call('HDEL', KEYS[2], member)
             n = n + 1
@@ -108,12 +145,26 @@ class RedisScheduler:
         self._visibility_timeout = visibility_timeout
         self._redis: Any = None
         self._pop_script: Any = None
+        self._push_script: Any = None
         self._recover_script: Any = None
+        self._clock_offset: float | None = None
+        self._clock_synced_at = 0.0
+        self._warned_score_precision = False
 
     async def _now(self) -> float:
-        """取 Redis 服务端时间，保证多节点使用同一时钟。"""
-        seconds, microseconds = await self._redis.time()
-        return seconds + microseconds / 1_000_000
+        """Redis 服务端时间，保证多节点使用同一时钟。
+
+        本地单调时钟负责推进，只定期与服务端校准一次偏移。每次 pop 都发一条
+        TIME 命令会让队列操作的网络往返翻倍，而可见性超时本身是分钟级的，
+        根本用不上那种精度。
+        """
+        loop = asyncio.get_running_loop()
+        local = loop.time()
+        if self._clock_offset is None or local - self._clock_synced_at > _CLOCK_RESYNC:
+            seconds, microseconds = await self._redis.time()
+            self._clock_offset = (seconds + microseconds / 1_000_000) - local
+            self._clock_synced_at = local
+        return local + self._clock_offset
 
     # ---- key 命名 ----
     @property
@@ -137,7 +188,10 @@ class RedisScheduler:
 
         self._redis = Redis.from_url(self._url, decode_responses=True)
         self._pop_script = self._redis.register_script(_POP_LUA)
+        self._push_script = self._redis.register_script(_PUSH_LUA)
         self._recover_script = self._redis.register_script(_RECOVER_LUA)
+
+        self._clock_offset = None
 
         if not self._resume:
             await self._redis.delete(
@@ -180,15 +234,32 @@ class RedisScheduler:
     # ---- 队列 ----
 
     async def push(self, request: Request) -> bool:
-        if not request.dont_filter:
-            if await self.seen(request.fingerprint()):
-                return False
+        self._check_score_precision(request.priority)
+        # 去重与入队必须是一次原子操作，中途失败会留下「已登记但没入队」的空洞
+        added = await self._push_script(
+            keys=[self._k_seen, self._k_seq, self._k_queue],
+            args=[
+                "" if request.dont_filter else request.fingerprint(),
+                request.to_json(),
+                request.priority,
+                _PRIORITY_SCALE,
+            ],
+        )
+        return bool(added)
 
-        seq = int(await self._redis.incr(self._k_seq))
-        score = -request.priority * _PRIORITY_SCALE + seq
-        member = f"{seq}|{request.to_json()}"
-        await self._redis.zadd(self._k_queue, {member: score})
-        return True
+    def _check_score_precision(self, priority: int) -> None:
+        """priority 过大时 score 会超出双精度的精确整数范围。"""
+        if self._warned_score_precision:
+            return
+        if abs(priority) * _PRIORITY_SCALE >= _MAX_EXACT_SCORE:
+            self._warned_score_precision = True
+            log.warning(
+                "priority_precision_loss",
+                priority=priority,
+                safe_abs_max=_MAX_EXACT_SCORE // _PRIORITY_SCALE,
+                hint="priority 绝对值过大，ZSET score 超出双精度整数范围，"
+                     "同优先级下的先进先出顺序将不再可靠",
+            )
 
     async def pop(self) -> Request | None:
         member = await self._pop_script(

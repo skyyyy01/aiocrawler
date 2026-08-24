@@ -18,6 +18,11 @@ Page 是每请求新建的——它足够轻，且能避免上一个页面的 JS
 
 默认拦截图片、字体、媒体。爬虫只要 DOM，下载这些纯属浪费带宽和时间，
 实测能显著缩短渲染耗时。需要截图时把 block_resources 设为空即可。
+
+## 证书校验
+
+跟随 settings.verify_ssl，与 HTTP 下载器保持一致。两条下载路径的安全级别必须
+一样，否则「配了 verify_ssl=True 却仍被中间人劫持」这种事会毫无征兆地发生。
 """
 
 from __future__ import annotations
@@ -59,6 +64,7 @@ class BrowserDownloader:
         block_resources: frozenset[str] | set[str] = DEFAULT_BLOCKED_RESOURCES,
         proxy: str | None = None,
         browser_type: str = "chromium",
+        verify_ssl: bool = True,
     ) -> None:
         self._headless = headless
         self._n_contexts = max(1, contexts)
@@ -69,6 +75,7 @@ class BrowserDownloader:
         self._blocked = frozenset(block_resources)
         self._proxy = proxy
         self._browser_type = browser_type
+        self._verify_ssl = verify_ssl
 
         self._pw: Any = None
         self._browser: Any = None
@@ -88,17 +95,23 @@ class BrowserDownloader:
             ) from exc
 
         self._pw = await async_playwright().start()
-        launcher = getattr(self._pw, self._browser_type)
-        self._browser = await launcher.launch(
-            headless=self._headless,
-            proxy={"server": self._proxy} if self._proxy else None,
-        )
+        try:
+            launcher = getattr(self._pw, self._browser_type)
+            self._browser = await launcher.launch(
+                headless=self._headless,
+                proxy={"server": self._proxy} if self._proxy else None,
+            )
 
-        self._pool = asyncio.Queue()
-        for _ in range(self._n_contexts):
-            ctx = await self._new_context()
-            self._contexts.append(ctx)
-            self._pool.put_nowait(ctx)
+            self._pool = asyncio.Queue()
+            for _ in range(self._n_contexts):
+                ctx = await self._new_context()
+                self._contexts.append(ctx)
+                self._pool.put_nowait(ctx)
+        except BaseException:
+            # 建到一半失败就得把已经拉起来的进程收干净，
+            # 否则每次重试都会多留一个孤儿 Chromium
+            await self.close()
+            raise
 
         log.info(
             "browser_started",
@@ -111,7 +124,10 @@ class BrowserDownloader:
         ctx = await self._browser.new_context(
             user_agent=self._user_agent,
             viewport=self._viewport,
-            ignore_https_errors=True,
+            # 跟随 verify_ssl 设置。此前这里硬编码为 True，导致无论怎么配，
+            # 浏览器渲染这条路径都不校验证书——同一个爬虫里 HTTP 请求校验、
+            # 渲染请求不校验，而且完全没有迹象表明它被关掉了
+            ignore_https_errors=not self._verify_ssl,
         )
         ctx.set_default_timeout(self._timeout_ms)
         if self._blocked:
@@ -186,9 +202,17 @@ class BrowserDownloader:
         self._contexts.clear()
         self._pool = None
 
+        # 每一步各自兜异常：browser.close() 失败若中断流程，playwright 的
+        # driver 进程就会永远留在那里
         if self._browser is not None:
-            await self._browser.close()
-            self._browser = None
+            browser, self._browser = self._browser, None
+            try:
+                await browser.close()
+            except Exception:  # pragma: no cover
+                log.warning("browser_close_failed", exc_info=True)
         if self._pw is not None:
-            await self._pw.stop()
-            self._pw = None
+            pw, self._pw = self._pw, None
+            try:
+                await pw.stop()
+            except Exception:  # pragma: no cover
+                log.warning("playwright_stop_failed", exc_info=True)

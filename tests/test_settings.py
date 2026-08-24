@@ -5,7 +5,9 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from aiocrawler.engine import Engine
 from aiocrawler.settings import Settings, load_settings, read_config_file
+from aiocrawler.spider import BaseSpider
 
 
 def write_toml(tmp_path, content: str) -> str:
@@ -111,3 +113,48 @@ class TestProjectConfigFile:
         s = load_settings("books", config_file="settings.toml")
         assert s.concurrency == 8
         assert s.download_delay == 0.1
+
+
+class TestEngineDoesNotReapplyCustomSettings:
+    """回归：Engine 曾经把 custom_settings 又合并一次，把命令行参数顶掉。
+
+    load_settings() 已经按「custom_settings < [spider.x] < 命令行」叠好层，
+    Engine 再叠一次就等于把 custom_settings 提到最高优先级——用户敲的
+    `-c 32 --delay 5` 全部失效，而且没有任何提示。对 --delay 来说这尤其糟：
+    想临时对生产站点降速，结果仍以代码里的间隔猛打。
+    """
+
+    class _Spider(BaseSpider):
+        name = "demo"
+        start_urls = []
+        custom_settings = {"concurrency": 8, "download_delay": 0.1}
+
+        async def parse(self, response):
+            yield
+
+    def test_cli_overrides_survive_engine_construction(self, tmp_path):
+        path = write_toml(tmp_path, "[default]\nconcurrency = 3\n")
+        spider = self._Spider()
+        settings = load_settings(
+            "demo",
+            custom_settings=spider.custom_settings,
+            cli_overrides={"concurrency": 32, "download_delay": 5.0},
+            config_file=path,
+        )
+        engine = Engine(spider, settings, pipelines=[], middlewares=[])
+        assert engine.settings.concurrency == 32
+        assert engine.settings.download_delay == 5.0
+
+    def test_spider_section_still_beats_custom_settings(self, tmp_path):
+        path = write_toml(tmp_path, "[spider.demo]\nconcurrency = 9\n")
+        spider = self._Spider()
+        settings = load_settings(
+            "demo", custom_settings=spider.custom_settings, config_file=path
+        )
+        engine = Engine(spider, settings, pipelines=[], middlewares=[])
+        assert engine.settings.concurrency == 9
+
+    def test_custom_settings_still_apply_without_load_settings(self):
+        """直接构造 Settings 的老用法不能被破坏：这时 Engine 仍要负责合并。"""
+        engine = Engine(self._Spider(), Settings(), pipelines=[], middlewares=[])
+        assert engine.settings.concurrency == 8

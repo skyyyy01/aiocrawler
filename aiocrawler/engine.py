@@ -56,8 +56,12 @@ class Engine:
         middlewares: list[Middleware] | None = None,
     ) -> None:
         base = settings or Settings()
-        # spider 的 custom_settings 覆盖全局配置
-        self.settings = base.merged(spider.custom_settings)
+        # 只有当调用方没处理过 custom_settings 时才在这里合并。load_settings()
+        # 已经按「custom_settings < [spider.x] < 命令行」的顺序叠好了层，这里
+        # 再叠一次会把 custom_settings 顶到最高优先级，命令行参数就此失效。
+        self.settings = (
+            base if base.custom_settings_applied else base.merged(spider.custom_settings)
+        )
 
         self.spider = spider
         self.stats = Stats()
@@ -71,6 +75,7 @@ class Engine:
         self._inflight = 0
         self._stopping = False
         self._reporter: asyncio.Task[None] | None = None
+        self._prev_handlers: list[signal.Signals] = []
 
     def _build_downloader(self) -> BaseDownloader:
         """默认装配混合下载器。
@@ -87,6 +92,7 @@ class Engine:
             verify_ssl=s.verify_ssl,
             default_headers=s.default_headers,
             proxy=s.proxy,
+            max_response_bytes=s.max_response_bytes,
         )
         browser = BrowserDownloader(
             headless=s.browser_headless,
@@ -95,6 +101,7 @@ class Engine:
             wait_until=s.browser_wait_until,
             block_resources=frozenset(s.browser_block_resources),
             proxy=s.proxy,
+            verify_ssl=s.verify_ssl,
         )
         return DownloaderRouter(http, browser, lazy_browser=True)
 
@@ -102,11 +109,17 @@ class Engine:
 
     async def run(self) -> Stats:
         self._install_signal_handlers()
-        await self.spider.on_start()
-        await self.scheduler.open()
-        await self.downloader.start()
-        await self.middlewares.open(self.spider)
-        await self.pipelines.open(self.spider)
+        try:
+            await self.spider.on_start()
+            await self.scheduler.open()
+            await self.downloader.start()
+            await self.middlewares.open(self.spider)
+            await self.pipelines.open(self.spider)
+        except BaseException:
+            # 装配到一半失败时，前面已经打开的组件同样需要收尾，
+            # 否则会漏掉数据库连接、浏览器进程这类外部资源
+            await self._shutdown()
+            raise
         self._reporter = asyncio.create_task(self._report_progress())
 
         try:
@@ -159,9 +172,17 @@ class Engine:
                 log.exception("request_handling_failed", url=request.url)
             finally:
                 # ack 必须在新请求入队之后（_handle 已返回），持久化调度器
-                # 才能安全地把这条记录移出队列
-                await self.scheduler.ack(request)
-                self._inflight -= 1
+                # 才能安全地把这条记录移出队列。
+                # ack 失败（如数据库瞬时不可用）只影响这一条记录的记账，不能让
+                # 异常逃出 worker——TaskGroup 会因此取消其余所有 worker，
+                # 把一次局部故障放大成整轮抓取中断。
+                try:
+                    await self.scheduler.ack(request)
+                except Exception:
+                    self.stats.inc("request/ack_failed")
+                    log.exception("scheduler_ack_failed", url=request.url)
+                finally:
+                    self._inflight -= 1
 
     async def _wait_for_work(self) -> bool:
         """本地已无事可做时，决定是收工还是再等等。
@@ -268,30 +289,55 @@ class Engine:
                 await self._reporter
             self._reporter = None
 
-        # 顺序要紧：先关管道（把缓冲刷进存储），再关中间件、下载器和调度器
-        await self.pipelines.close(self.spider)
-        await self.middlewares.close(self.spider)
-        await self.downloader.close()
-        await self.scheduler.close()
-        await self.spider.on_close()
+        # 顺序要紧：先关管道（把缓冲刷进存储），再关中间件、下载器和调度器。
+        # 每一步各自兜异常：任何一步抛错都不能连累后面的步骤，否则一个组件
+        # 关闭失败就会漏掉数据库连接、浏览器进程，甚至跳过 spider 的收尾钩子。
+        for label, closer in (
+            ("pipelines", lambda: self.pipelines.close(self.spider)),
+            ("middlewares", lambda: self.middlewares.close(self.spider)),
+            ("downloader", self.downloader.close),
+            ("scheduler", self.scheduler.close),
+            ("spider", self.spider.on_close),
+        ):
+            try:
+                await closer()
+            except Exception:
+                log.exception("component_close_failed", component=label)
+
+        self._restore_signal_handlers()
 
     def _install_signal_handlers(self) -> None:
         """Ctrl-C 时优雅收尾：停止取新请求，让在途请求跑完，刷净缓冲。
 
-        再按一次 Ctrl-C 会走默认行为直接中断。
+        再按一次 Ctrl-C 立刻恢复默认行为直接中断——收尾本身也可能卡住
+        （比如存储后端没响应），必须给使用者留一条硬退出的路。
         """
         loop = asyncio.get_running_loop()
+        self._prev_handlers = []
 
         def _request_stop(sig: signal.Signals) -> None:
-            if self._stopping:
-                return
             self._stopping = True
+            # 让位给默认行为：下一次同样的信号直接中断进程
+            with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+                loop.remove_signal_handler(sig)
             log.warning("shutdown_requested", signal=sig.name,
                         hint="正在等待在途请求完成并刷写缓冲，再按一次 Ctrl-C 强制退出")
 
         for sig in (signal.SIGINT, signal.SIGTERM):
             with contextlib.suppress(NotImplementedError, RuntimeError):
                 loop.add_signal_handler(sig, _request_stop, sig)
+                self._prev_handlers.append(sig)
+
+    def _restore_signal_handlers(self) -> None:
+        """交还信号控制权。
+
+        引擎可能只是宿主程序里的一段流程，跑完之后不该继续霸占 SIGINT。
+        """
+        loop = asyncio.get_running_loop()
+        for sig in getattr(self, "_prev_handlers", []):
+            with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+                loop.remove_signal_handler(sig)
+        self._prev_handlers = []
 
 
 async def crawl(

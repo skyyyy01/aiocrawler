@@ -21,6 +21,9 @@ sqlite = ["aiosqlite>=0.21"]
 postgres = ["asyncpg>=0.30"]
 mysql = ["aiomysql>=0.2"]
 mongo = ["pymongo>=4.13"]          # 注意：不用 motor，PyMongo 4.13+ 已内置 async
+# 阶段 6：分布式共享队列（aiocrawler run --redis）
+# 5.0.1 起才有 Redis.aclose()
+redis = ["redis>=5.0.1"]
 dev = ["pytest>=8", "pytest-asyncio>=1.0", "respx>=0.22"]
 
 [project.scripts]

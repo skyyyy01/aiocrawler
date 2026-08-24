@@ -14,7 +14,7 @@ from aiocrawler.middleware.base import Middleware, MiddlewareManager
 from aiocrawler.middleware.proxy import ProxyMiddleware
 from aiocrawler.middleware.retry import RetryMiddleware
 from aiocrawler.middleware.robots import RobotsMiddleware
-from aiocrawler.middleware.throttle import ThrottleMiddleware
+from aiocrawler.middleware.throttle import ThrottleMiddleware, domain_key
 from aiocrawler.middleware.useragent import UserAgentMiddleware
 from aiocrawler.models import Request, Response
 from aiocrawler.settings import Settings
@@ -371,7 +371,16 @@ class TestProxyMiddleware:
         mw = ProxyMiddleware(["http://p1:8080"])
         req = Request("http://a.com/")
         await mw.process_request(req)
-        assert req.meta["proxy"] == "http://p1:8080"
+        # 自动挑选的代理放在下划线键里，不会被序列化进队列
+        assert req.meta["_proxy"] == "http://p1:8080"
+
+    async def test_auto_proxy_credentials_never_serialized(self):
+        """自动分配的代理常带账号密码，绝不能跟着请求写进队列存储。"""
+        mw = ProxyMiddleware(["http://user:secret@p1:8080"])
+        req = Request("http://a.com/")
+        await mw.process_request(req)
+        assert "secret" not in req.to_json()
+        assert "_proxy" not in req.to_dict()["meta"]
 
     async def test_manual_proxy_respected(self):
         mw = ProxyMiddleware(["http://p1:8080"])
@@ -383,7 +392,7 @@ class TestProxyMiddleware:
         mw = ProxyMiddleware(["http://p1:8080", "http://p2:8080"], cooldown=30)
         req = Request("http://a.com/")
         await mw.process_request(req)
-        failed = req.meta["proxy"]
+        failed = req.meta["_proxy"]
 
         await mw.process_exception(req, httpx.ConnectError("x"))
 
@@ -391,7 +400,7 @@ class TestProxyMiddleware:
         for i in range(10):
             r = Request(f"http://a.com/{i}")
             await mw.process_request(r)
-            assert r.meta.get("proxy") != failed
+            assert r.meta.get("_proxy") != failed
 
     async def test_falls_back_to_direct_when_all_cooling(self):
         mw = ProxyMiddleware(["http://p1:8080"], cooldown=30, fallback_direct=True)
@@ -401,7 +410,7 @@ class TestProxyMiddleware:
 
         nxt = Request("http://a.com/2")
         await mw.process_request(nxt)
-        assert "proxy" not in nxt.meta  # 退回直连而不是卡死
+        assert "_proxy" not in nxt.meta  # 退回直连而不是卡死
 
     def test_empty_pool_rejected(self):
         with pytest.raises(ValueError):
@@ -437,3 +446,76 @@ class TestDefaultChain:
         chain = build_default_middlewares(Settings(proxies=["http://p:1"]))
         idx = {type(m).__name__: i for i, m in enumerate(chain)}
         assert idx["ProxyMiddleware"] < idx["ThrottleMiddleware"]
+
+
+class TestRetryAfterIsBounded:
+    """回归：Retry-After 完全由服务端控制，不设上限等于把 worker 的生死
+    交给对方——一个 `Retry-After: 86400` 就能让它睡满一天。"""
+
+    async def test_huge_retry_after_is_capped(self):
+        mw = RetryMiddleware(max_retries=3, backoff_base=1.0, max_backoff=0.05)
+        req = Request("https://evil.example/x")
+        resp = Response(
+            url=req.url, status=429,
+            headers={"retry-after": "86400"}, body=b"", request=req,
+        )
+
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        result = await mw.process_response(req, resp)
+        elapsed = loop.time() - started
+
+        assert isinstance(result, Request)
+        # 实际等待被夹到 max_backoff，而不是服务端要的 86400 秒
+        assert elapsed < 1.0, elapsed
+
+    async def test_reasonable_retry_after_still_respected(self):
+        mw = RetryMiddleware(max_retries=3, max_backoff=60.0)
+        assert mw._parse_retry_after("2") == 2.0
+
+
+class TestResponseChainContract:
+    """回归：process_response 忘了 return，None 会一路传到引擎被当成
+    「请求已放弃」，页面就这么无声无息地少了一个。"""
+
+    async def test_none_from_process_response_raises(self):
+        class Forgetful(Middleware):
+            async def process_response(self, request, response):
+                pass   # 忘了 return
+
+        class Dummy:
+            async def start(self): ...
+            async def close(self): ...
+            async def fetch(self, request):
+                return Response(
+                    url=request.url, status=200, headers={}, body=b"", request=request
+                )
+
+        mgr = MiddlewareManager(Dummy(), [Forgetful()])
+        with pytest.raises(TypeError, match="返回了 None"):
+            await mgr.download(Request("https://x.com/"))
+
+
+class TestThrottleDomainKey:
+    """回归：直接用 netloc 当键，大小写和默认端口会各占一个桶，限速被绕过。"""
+
+    def test_variants_share_one_bucket(self):
+        keys = {
+            domain_key("https://Example.com/a"),
+            domain_key("https://example.com/b"),
+            domain_key("https://EXAMPLE.com:443/c"),
+        }
+        assert len(keys) == 1
+
+    def test_non_default_port_is_distinct(self):
+        assert domain_key("https://example.com:8443/") != domain_key("https://example.com/")
+
+    async def test_same_site_requests_are_serialized(self):
+        mw = ThrottleMiddleware(delay=0.05, jitter=0)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        await asyncio.gather(*[
+            mw.process_request(Request(f"https://Example.com/{i}")) for i in range(3)
+        ])
+        # 三个大小写不同的写法必须落进同一个桶，共走两次间隔
+        assert loop.time() - started >= 0.09
