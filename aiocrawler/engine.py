@@ -70,12 +70,23 @@ class Engine:
         self.pipelines = PipelineManager(pipelines or [])
         # 传 None 用默认链；传空列表则显式表示「不要任何中间件」（测试常用）
         chain = build_default_middlewares(self.settings) if middlewares is None else middlewares
-        self.middlewares = MiddlewareManager(self.downloader, chain)
+        self.middlewares = MiddlewareManager(
+            self.downloader, chain, concurrency_per_domain=self._per_domain_limit()
+        )
 
         self._inflight = 0
         self._stopping = False
         self._reporter: asyncio.Task[None] | None = None
         self._prev_handlers: list[signal.Signals] = []
+
+    def _per_domain_limit(self) -> int | None:
+        """单域名并发上限，不可能触发时返回 None。
+
+        上限不小于全局并发数时，同域名请求根本凑不够那么多，信号量永远不会
+        阻塞——这时留着它只是白白多一层 acquire/release。
+        """
+        limit = self.settings.concurrency_per_domain
+        return limit if limit < self.settings.concurrency else None
 
     def _build_downloader(self) -> BaseDownloader:
         """默认装配混合下载器。

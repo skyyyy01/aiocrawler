@@ -23,34 +23,20 @@ from __future__ import annotations
 import asyncio
 import random
 from collections import defaultdict
-from urllib.parse import urlsplit
 
 import structlog
 
 from aiocrawler.middleware.base import Middleware
-from aiocrawler.models import Request
+# domain_key 定义在 models 里：限速与限并发（middleware/base.py）必须共用
+# 同一套分桶规则，否则两者对「同一个站点」的理解会不一致
+from aiocrawler.models import Request, domain_key
 
 log = structlog.get_logger(__name__)
 
+__all__ = ["ThrottleMiddleware", "domain_key"]
+
 #: 累积到这么多域名就清一次过期条目
 _GC_THRESHOLD = 10_000
-
-#: scheme 的默认端口，规范化时剥掉
-_DEFAULT_PORTS = {"http": 80, "https": 443}
-
-
-def domain_key(url: str) -> str:
-    """把 URL 归一成限速用的域名键。
-
-    小写化，并剥掉与 scheme 对应的默认端口——`example.com` 和 `example.com:443`
-    指向同一台服务器，必须落进同一个桶。
-    """
-    parts = urlsplit(url)
-    host = (parts.hostname or "").lower()
-    port = parts.port
-    if port is not None and port != _DEFAULT_PORTS.get(parts.scheme.lower()):
-        return f"{host}:{port}"
-    return host
 
 
 class ThrottleMiddleware(Middleware):

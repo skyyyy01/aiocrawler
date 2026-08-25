@@ -44,6 +44,25 @@ def canonicalize_url(url: str) -> str:
     ))
 
 
+#: scheme 的默认端口，规范化域名时剥掉
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def domain_key(url: str) -> str:
+    """把 URL 归一成「站点」标识，用于按域名限速与限并发。
+
+    小写化，并剥掉与 scheme 对应的默认端口——`Example.com`、`example.com`、
+    `example.com:443` 指向同一台服务器，必须落进同一个桶，否则限制会被绕开
+    （每种写法各自占一份额度，对同一台机器的实际压力成倍上去）。
+    """
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    port = parts.port
+    if port is not None and port != _DEFAULT_PORTS.get(parts.scheme.lower()):
+        return f"{host}:{port}"
+    return host
+
+
 @dataclass(slots=True)
 class Request:
     """一个待抓取的请求。

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 
 import httpx
 import pytest
@@ -14,10 +15,11 @@ from aiocrawler.middleware.base import Middleware, MiddlewareManager
 from aiocrawler.middleware.proxy import ProxyMiddleware
 from aiocrawler.middleware.retry import RetryMiddleware
 from aiocrawler.middleware.robots import RobotsMiddleware
-from aiocrawler.middleware.throttle import ThrottleMiddleware, domain_key
+from aiocrawler.middleware.throttle import ThrottleMiddleware
 from aiocrawler.middleware.useragent import UserAgentMiddleware
-from aiocrawler.models import Request, Response
+from aiocrawler.models import Request, Response, domain_key
 from aiocrawler.settings import Settings
+from aiocrawler.spider import BaseSpider
 
 
 class FakeDownloader:
@@ -519,3 +521,214 @@ class TestThrottleDomainKey:
         ])
         # 三个大小写不同的写法必须落进同一个桶，共走两次间隔
         assert loop.time() - started >= 0.09
+
+
+class TestConcurrencyPerDomain:
+    """单域名并发上限。它管「同时在飞几个」，与 download_delay 管的「间隔」无关。"""
+
+    class TrackingDownloader:
+        """记录每个域名的并发峰值。"""
+
+        def __init__(self, delay: float = 0.02):
+            self.delay = delay
+            self.current: Counter = Counter()
+            self.peak: Counter = Counter()
+
+        async def start(self): ...
+        async def close(self): ...
+
+        async def fetch(self, request: Request) -> Response:
+            domain = domain_key(request.url)
+            self.current[domain] += 1
+            self.peak[domain] = max(self.peak[domain], self.current[domain])
+            try:
+                await asyncio.sleep(self.delay)
+                return Response(
+                    url=request.url, status=200, headers={}, body=b"", request=request
+                )
+            finally:
+                self.current[domain] -= 1
+
+    async def test_caps_in_flight_requests(self):
+        dl = self.TrackingDownloader()
+        mgr = MiddlewareManager(dl, [], concurrency_per_domain=3)
+        await asyncio.gather(*[
+            mgr.download(Request(f"https://a.com/{i}")) for i in range(12)
+        ])
+        assert dl.peak["a.com"] == 3
+
+    async def test_domains_are_independent(self):
+        dl = self.TrackingDownloader()
+        mgr = MiddlewareManager(dl, [], concurrency_per_domain=2)
+        await asyncio.gather(*[
+            mgr.download(Request(f"https://{host}/{i}"))
+            for host in ("a.com", "b.com")
+            for i in range(6)
+        ])
+        # 各域名各自占满额度，互不挤压
+        assert dl.peak["a.com"] == 2
+        assert dl.peak["b.com"] == 2
+
+    async def test_case_and_default_port_share_one_budget(self):
+        """大小写/默认端口的不同写法必须共用一份额度，否则上限可被绕过。"""
+        dl = self.TrackingDownloader()
+        mgr = MiddlewareManager(dl, [], concurrency_per_domain=2)
+        urls = [
+            "https://a.com/1", "https://A.com/2", "https://a.com:443/3",
+            "https://A.COM:443/4", "https://a.com/5", "https://a.com/6",
+        ]
+        await asyncio.gather(*[mgr.download(Request(u)) for u in urls])
+        assert dl.peak["a.com"] == 2
+
+    async def test_none_means_unlimited(self):
+        dl = self.TrackingDownloader()
+        mgr = MiddlewareManager(dl, [], concurrency_per_domain=None)
+        await asyncio.gather(*[
+            mgr.download(Request(f"https://a.com/{i}")) for i in range(8)
+        ])
+        assert dl.peak["a.com"] == 8
+
+    async def test_slot_released_on_download_error(self):
+        """下载抛异常也必须还回额度，否则该域名会被逐步卡死。"""
+
+        class Boom:
+            async def start(self): ...
+            async def close(self): ...
+            async def fetch(self, request):
+                raise httpx.ConnectError("boom")
+
+        mgr = MiddlewareManager(Boom(), [], concurrency_per_domain=1)
+        for _ in range(3):
+            with pytest.raises(httpx.ConnectError):
+                await mgr.download(Request("https://a.com/x"))
+        # 额度全部归还，条目也随之回收
+        assert mgr._slots.active_domains() == 0
+
+    async def test_limit_holds_when_requests_arrive_in_waves(self):
+        """后到的请求必须复用同一份额度。
+
+        条目按引用计数回收。若计数只在**拿到**额度后才加，排队中的请求就不
+        算数：前一批排空的瞬间条目会被误删，后到的请求于是新建一个信号量，
+        两拨请求各自持有一份额度，上限被悄悄突破。
+        一次性 gather 发起的请求都在同一个 await 点前取到了同一个信号量对象，
+        掩盖了这个问题——必须让请求分批到达才能暴露。
+        """
+
+        class SteppedDownloader:
+            """每个 fetch 停在自己的闸门上，由测试逐个放行。"""
+
+            def __init__(self):
+                self.current = 0
+                self.peak = 0
+                self.gates: list[asyncio.Event] = []
+
+            async def start(self): ...
+            async def close(self): ...
+
+            async def fetch(self, request: Request) -> Response:
+                gate = asyncio.Event()
+                self.gates.append(gate)
+                self.current += 1
+                self.peak = max(self.peak, self.current)
+                try:
+                    await gate.wait()
+                    return Response(
+                        url=request.url, status=200, headers={},
+                        body=b"", request=request,
+                    )
+                finally:
+                    self.current -= 1
+
+        dl = SteppedDownloader()
+        mgr = MiddlewareManager(dl, [], concurrency_per_domain=1)
+
+        # 第一批：A 拿到额度进入 fetch，B 在信号量上排队
+        a = asyncio.create_task(mgr.download(Request("https://a.com/a")))
+        b = asyncio.create_task(mgr.download(Request("https://a.com/b")))
+        await asyncio.sleep(0.01)
+        assert len(dl.gates) == 1, "limit=1，此刻只该有一个请求在飞"
+
+        # 放行 A：额度交接给 B。错误实现会在这一刻把条目删掉
+        dl.gates[0].set()
+        await asyncio.sleep(0.01)
+        assert len(dl.gates) == 2, "B 应当接过额度"
+
+        # 第二批：C 在 B 仍在飞时到达，必须排队而不是另起一份额度
+        c = asyncio.create_task(mgr.download(Request("https://a.com/c")))
+        await asyncio.sleep(0.01)
+
+        assert dl.peak == 1, f"同域名并发峰值应为 1，实际 {dl.peak}"
+
+        for gate in dl.gates:
+            gate.set()
+        await asyncio.sleep(0.01)
+        for gate in dl.gates:
+            gate.set()
+        await asyncio.gather(a, b, c)
+
+    async def test_entries_are_reclaimed(self):
+        """条目按引用计数回收，内存不随「历史见过的域名数」增长。"""
+        dl = self.TrackingDownloader(delay=0)
+        mgr = MiddlewareManager(dl, [], concurrency_per_domain=2)
+        for i in range(50):
+            await mgr.download(Request(f"https://site{i}.com/"))
+        assert mgr._slots.active_domains() == 0
+
+    async def test_slot_not_held_during_middleware_sleep(self):
+        """额度只圈 fetch()，不圈中间件钩子。
+
+        限速的等待在 ThrottleMiddleware.process_request 里、重试退避在
+        RetryMiddleware.process_response 里，都是 sleep。若额度圈住整条链，
+        「同域名最多 N 个在飞」就退化成了「最多 N 个在排队」。
+        """
+        observed: list = []
+        mgr: MiddlewareManager
+
+        class SlowHook(Middleware):
+            async def process_request(self, request):
+                # 记录进入钩子这一刻该域名有没有被占额度
+                observed.append(mgr._slots._sems.get("a.com"))
+                await asyncio.sleep(0.02)
+                return None
+
+        dl = self.TrackingDownloader(delay=0)
+        mgr = MiddlewareManager(dl, [SlowHook()], concurrency_per_domain=1)
+        await asyncio.gather(*[
+            mgr.download(Request(f"https://a.com/{i}")) for i in range(4)
+        ])
+
+        # 正确实现：4 个请求都能同时走到 process_request 并在那里 sleep，
+        # 此时还没有任何一个占住额度。
+        # 若额度圈了整条链（limit=1）：第 1 个进来就 acquire，其余 3 个卡在
+        # acquire 上根本进不了钩子——observed 只会有 1 个元素。
+        assert len(observed) == 4
+        assert all(x is None for x in observed)
+
+
+class TestPerDomainLimitWiring:
+    """引擎装配：上限 >= 全局并发时不可能触发，应当直接跳过这层。"""
+
+    def _engine(self, **kw):
+        from aiocrawler.engine import Engine
+
+        class _S(BaseSpider):
+            name = "t"
+            start_urls = []
+
+            async def parse(self, response):
+                yield
+
+        return Engine(_S(), Settings(**kw), pipelines=[], middlewares=[])
+
+    def test_disabled_when_not_below_global_concurrency(self):
+        assert self._engine(concurrency=8, concurrency_per_domain=8)._per_domain_limit() is None
+        assert self._engine(concurrency=4, concurrency_per_domain=16)._per_domain_limit() is None
+
+    def test_enabled_when_below(self):
+        assert self._engine(concurrency=16, concurrency_per_domain=4)._per_domain_limit() == 4
+
+    def test_manager_gets_the_limit(self):
+        engine = self._engine(concurrency=16, concurrency_per_domain=4)
+        assert engine.middlewares._slots is not None
+        engine = self._engine(concurrency=4, concurrency_per_domain=8)
+        assert engine.middlewares._slots is None

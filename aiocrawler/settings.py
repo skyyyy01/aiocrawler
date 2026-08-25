@@ -32,12 +32,14 @@ class Settings(BaseModel):
 
     # ---- 并发 ----
     concurrency: int = Field(default=16, ge=1, description="全局并发 worker 数")
-    #: **当前尚未实现**，设置它不会有任何效果。同域名的请求速率实际由
-    #: download_delay 控制（ThrottleMiddleware 会把同域名请求串行化）。
-    #: 保留该字段是为了不让已有 settings.toml 因 extra="forbid" 而报错。
-    concurrency_per_domain: int = Field(
-        default=8, ge=1, description="单域名并发上限（尚未实现，请用 download_delay）"
-    )
+    #: 单个域名同时在途的请求数上限，在 MiddlewareManager 里落地。
+    #: 它管的是「并发」，download_delay 管的是「间隔」，两者独立：
+    #: download_delay > 0 时同域名请求已被 ThrottleMiddleware 串行化，
+    #: 这个上限基本不会触发；真正起作用的是 download_delay = 0 的场景，
+    #: 以及同时抓多个站点时——防止某个慢站点把所有 worker 都占住，
+    #: 让其他站点完全抓不动。
+    #: 取值 >= concurrency 等于不限制（引擎会直接跳过这层）。
+    concurrency_per_domain: int = Field(default=8, ge=1, description="单域名并发上限")
 
     # ---- 下载 ----
     timeout: float = Field(default=20.0, gt=0)
