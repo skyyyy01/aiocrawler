@@ -5,6 +5,9 @@ description = "自研 Python 异步爬虫框架：可插拔的调度器、下载
 requires-python = ">=3.12"
 license = "MIT"
 license-files = ["LICENSE"]
+authors = [
+    { name = "SKY", email = "107405991+skyn9@users.noreply.github.com" },
+]
 dependencies = [
     "httpx[http2]>=0.28",
     "selectolax>=0.4",
@@ -25,6 +28,11 @@ mongo = ["pymongo>=4.13"]          # 注意：不用 motor，PyMongo 4.13+ 已�
 # 5.0.1 起才有 Redis.aclose()
 redis = ["redis>=5.0.1"]
 dev = ["pytest>=8", "pytest-asyncio>=1.0", "respx>=0.22"]
+
+[project.urls]
+Homepage = "https://github.com/skyn9/aiocrawler"
+Repository = "https://github.com/skyn9/aiocrawler"
+Issues = "https://github.com/skyn9/aiocrawler/issues"
 
 [project.scripts]
 aiocrawler = "aiocrawler.cli:app"

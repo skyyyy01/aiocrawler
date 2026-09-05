@@ -3,6 +3,7 @@
 **[English](README.md)** | [中文](docs/README_ZH.md)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![GitHub](https://img.shields.io/badge/GitHub-skyn9%2Faiocrawler-181717?logo=github)](https://github.com/skyn9/aiocrawler)
 
 An async web crawling framework for Python, built from scratch. Scheduler,
 downloader, middleware chain, pipeline and storage backends are all implemented
@@ -23,6 +24,8 @@ on top of `asyncio` + `httpx` — no Scrapy dependency.
 ## Quick start
 
 ```bash
+git clone https://github.com/skyn9/aiocrawler.git && cd aiocrawler
+
 # Install (optional groups as needed)
 .venv/bin/pip install -e ".[dev,browser,sqlite,postgres,mysql,mongo,redis]"
 .venv/bin/playwright install chromium        # only for browser rendering

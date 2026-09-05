@@ -3,6 +3,7 @@
 [English](../README.md) | **[中文](README_ZH.md)**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../LICENSE)
+[![GitHub](https://img.shields.io/badge/GitHub-skyn9%2Faiocrawler-181717?logo=github)](https://github.com/skyn9/aiocrawler)
 
 自研 Python 异步爬虫框架。基于 `asyncio` + `httpx` 从零实现调度器、下载器、
 中间件链、管道与存储后端——不依赖 Scrapy。
@@ -22,6 +23,8 @@
 ## 快速开始
 
 ```bash
+git clone https://github.com/skyn9/aiocrawler.git && cd aiocrawler
+
 # 安装（按需选装可选组）
 .venv/bin/pip install -e ".[dev,browser,sqlite,postgres,mysql,mongo,redis]"
 .venv/bin/playwright install chromium        # 仅浏览器渲染需要
